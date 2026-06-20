@@ -29,7 +29,7 @@
 skips:
 
   - id: tests/e2e/omnigent/test_run_harness_without_agent_e2e.py::test_run_harness_without_agent_live_repl_round_trip[claude-sdk]
-    reason: "Hangs >180s in CI -> xdist worker crash even on the mock LLM (#796 migration): the claude-sdk native claude-code CLI calls auth/metadata endpoints the mock server does not serve, so its headless -p turn never completes. Distinct from the stale-glyph fix that greened the openai-agents/codex rows; claude-sdk is mock-incompatible and should be excluded from the mock matrix (or the mock taught to serve the claude-code endpoints). Not the old live-gateway hang (that was removed by the mock migration)."
+    reason: "claude-code CLI mock-incompatible in the no-AGENT path. Traced 2026-06-20 (CI run 27874751026 + local, claude-code 2.1.179): with no Anthropic creds the CLI prints 'Not logged in - Please run /login' and exits (CI's fresh env); supplying a raw ANTHROPIC_API_KEY via ambient adoption gets past that but the CLI's external-key validation against the mock fails with 'Invalid API key - Fix external API key' (a real-format sk-ant- key fails identically -> it's a validation request, not a format check). The gateway apiKeyHelper path that greens the agent-spec claude-sdk tests (yaml_agent_with_tools[claude-sdk]) is not reachable for the no-AGENT launcher (HARNESS_CLAUDE_SDK_GATEWAY_* overrides are ignored there). So this row needs the mock to satisfy claude-code's startup external-key validation, or a real login -- neither available in CI. Locally it only 'works' because the dev's claude-code is logged in. Codex/pi/openai-agents pass via OPENAI_* env."
     issue: 523
     cluster: mock-claude-sdk-cli-unsupported
     mode: skip
