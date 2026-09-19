@@ -517,8 +517,8 @@ class DatabricksGenieExecutor(Executor):
         agent id — to converse with (from ``executor.model``). When unset,
         :meth:`run_turn` yields an :class:`ExecutorError` instructing the user
         to set it.
-    :param profile: The Databricks profile from ``~/.databrickscfg`` used to
-        authenticate. ``None`` lets the SDK use its own resolution order
+    :param profile: The Databricks CLI config profile used to authenticate.
+        ``None`` lets the SDK use its own resolution order
         (``DATABRICKS_CONFIG_PROFILE`` env / ``DEFAULT`` section).
     :param client: An injected ``OpenAI`` client (tests pass a fake). When
         ``None``, one is built lazily on the first turn so a missing
