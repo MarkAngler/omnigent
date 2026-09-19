@@ -30,6 +30,10 @@ from omnigent.spec._omnigent_compat import OMNIGENT_HARNESSES
         ("agy", "antigravity"),
         ("google-antigravity", "antigravity"),
         ("antigravity", "antigravity"),
+        # Antigravity native harness aliases.
+        ("agy-native", "antigravity-native"),
+        ("native-agy", "antigravity-native"),
+        ("native-antigravity", "antigravity-native"),
         # Databricks Genie Spaces harness: short alias → canonical id.
         ("genie", "databricks-genie"),
         ("databricks-genie", "databricks-genie"),
@@ -60,6 +64,10 @@ def test_canonicalize_harness(alias: str | None, canonical: str | None) -> None:
         ("native-pi", True),
         ("kiro-native", True),
         ("native-kiro", True),
+        ("antigravity-native", True),
+        ("native-antigravity", True),
+        ("agy-native", True),
+        ("native-agy", True),
         # SDK harnesses are NOT native — they replay the Omnigent
         # transcript and don't own an on-disk runtime transcript. A
         # regression that classified these as native would wrongly route a
@@ -70,6 +78,8 @@ def test_canonicalize_harness(alias: str | None, canonical: str | None) -> None:
         ("agents_sdk", False),
         ("codex", False),
         ("kiro", False),
+        ("antigravity", False),
+        ("agy", False),
         # The "claude" shorthand canonicalizes to claude-sdk (not native).
         ("claude", False),
         # cursor is a headless ACP harness, not a native CLI bridge.
@@ -111,6 +121,9 @@ def test_kiro_native_is_valid_omnigent_harness_but_plain_kiro_is_not() -> None:
         ("kimi-native", "kimi"),
         ("pi-native", "pi"),
         ("antigravity-native", "antigravity"),
+        ("native-antigravity", "antigravity"),
+        ("agy-native", "antigravity"),
+        ("native-agy", "antigravity"),
         ("opencode-native", "opencode"),
         ("opencode", "opencode"),  # alias folds to opencode-native
         # Non-native harnesses (and the SDK shorthands) have no native pane.

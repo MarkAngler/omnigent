@@ -34,6 +34,15 @@ final class SettingsStore: ObservableObject {
     recentServers = defaults.stringArray(forKey: Keys.recentServers) ?? []
   }
 
+  func stopAutoOpening(_ context: DatabricksWebContext) {
+    guard let saved = serverURL, let url = URL(string: saved),
+      let scope = try? DatabricksCredentialScope(
+        workspaceURL: url, configuration: context.configuration),
+      scope == context.scope
+    else { return }
+    serverURL = nil
+  }
+
   func rememberRecentServer(_ url: URL) {
     let value = url.absoluteString
     let deduped: [String] = [value] + recentServers.filter { $0 != value }
@@ -82,7 +91,7 @@ final class SettingsStore: ObservableObject {
 
 #if DEBUG
   extension ProcessInfo {
-    fileprivate func omnigentArgumentValue(after argumentName: String) -> String? {
+    func omnigentArgumentValue(after argumentName: String) -> String? {
       guard let index = arguments.firstIndex(of: argumentName) else { return nil }
       let valueIndex = arguments.index(after: index)
       guard arguments.indices.contains(valueIndex) else { return nil }

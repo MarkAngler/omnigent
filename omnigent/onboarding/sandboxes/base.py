@@ -20,21 +20,27 @@ from __future__ import annotations
 
 import base64
 import json
+import logging
+import math
+import os
 import secrets
 import shlex
 from abc import ABC, abstractmethod
-from contextlib import AbstractContextManager
+from contextlib import AbstractContextManager, nullcontext
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, ClassVar
 
 import click
 
+from omnigent.host import HOST_FATAL_EXIT_CODE, HOST_SIGTERM_EXIT_CODE
 from omnigent.host.identity import HOST_ID_ENV_VAR, HOST_NAME_ENV_VAR, HOST_TOKEN_ENV_VAR
 from omnigent.onboarding.sandboxes import types as _sandbox_types
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Iterator
+    from collections.abc import Callable, Iterator, Sequence
     from pathlib import Path
+
+    from omnigent.onboarding.sandboxes.types import RepoWorkspace
 
 
 DEFAULT_HOST_IMAGE: str = "ghcr.io/omnigent-ai/omnigent-host:latest"
@@ -45,6 +51,90 @@ pins a commit). It bakes the full omnigent install plus git / tmux /
 curl and the coding-harness CLIs, so sandbox creation skips the
 in-sandbox dependency install. Providers layer their own override
 mechanisms (env var / server config) on top of this default."""
+
+_logger = logging.getLogger(__name__)
+
+MANAGED_KEEPALIVE_INTERVAL_ENV_VAR: str = "OMNIGENT_MANAGED_KEEPALIVE_INTERVAL_S"
+"""Environment variable overriding the managed-sandbox keepalive cadence (seconds)."""
+
+# Global default keepalive cadence, used by every managed provider except
+# agent_sandbox. Providers whose keep_alive is idempotent ("configure once")
+# don't need a fast cadence, so the default stays cheap.
+_DEFAULT_MANAGED_KEEPALIVE_INTERVAL_S: float = 600.0
+# agent_sandbox pushes an absolute shutdownTime forward and runs a SHORT window,
+# so it must refresh fast (its window floor is twice this). Scoped to the
+# provider so lowering it does not multiply every other provider's write load.
+_AGENT_SANDBOX_KEEPALIVE_INTERVAL_S: float = 60.0
+_MIN_MANAGED_KEEPALIVE_INTERVAL_S: float = 5.0
+# Ceiling so a finite-but-huge override (e.g. 1e308) cannot overflow the
+# window-floor math (ceil(2 * interval)); an hour is already far past useful.
+_MAX_MANAGED_KEEPALIVE_INTERVAL_S: float = 3600.0
+
+
+def resolve_managed_keepalive_interval_s(provider: str | None = None) -> float:
+    """
+    How often the server refreshes a live managed sandbox's liveness, in seconds.
+
+    Provider-scoped default: ``agent_sandbox`` refreshes fast (60s) because it
+    pushes an absolute deadline forward under a short window; every other
+    provider uses the cheaper 600s default. :data:`MANAGED_KEEPALIVE_INTERVAL_ENV_VAR`
+    overrides both when set (advanced/experimental — the operator-facing knob is
+    ``keep_warm_s``), floored at a small minimum so a typo cannot spin the loop.
+    Resolved live from the env on each call (no snapshot), so the server loop
+    cadence and the ``agent_sandbox`` window floor cannot disagree.
+    """
+    default = (
+        _AGENT_SANDBOX_KEEPALIVE_INTERVAL_S
+        if provider == "agent_sandbox"
+        else _DEFAULT_MANAGED_KEEPALIVE_INTERVAL_S
+    )
+    raw = os.environ.get(MANAGED_KEEPALIVE_INTERVAL_ENV_VAR, "").strip()
+    if not raw:
+        return default
+    try:
+        parsed = float(raw)
+    except ValueError:
+        _logger.warning(
+            "ignoring %s=%r (not a number); using %ss",
+            MANAGED_KEEPALIVE_INTERVAL_ENV_VAR,
+            raw,
+            default,
+        )
+        return default
+    if not math.isfinite(parsed):
+        # "nan"/"inf" parse cleanly but blow up downstream in int/ceil(2 * x);
+        # a non-finite typo must fail safe like any other bad value.
+        _logger.warning(
+            "ignoring %s=%r (not a finite number); using %ss",
+            MANAGED_KEEPALIVE_INTERVAL_ENV_VAR,
+            raw,
+            default,
+        )
+        return default
+    if parsed < _MIN_MANAGED_KEEPALIVE_INTERVAL_S:
+        _logger.warning(
+            "%s=%r is below the %ss minimum; using %ss",
+            MANAGED_KEEPALIVE_INTERVAL_ENV_VAR,
+            raw,
+            _MIN_MANAGED_KEEPALIVE_INTERVAL_S,
+            _MIN_MANAGED_KEEPALIVE_INTERVAL_S,
+        )
+        return _MIN_MANAGED_KEEPALIVE_INTERVAL_S
+    if parsed > _MAX_MANAGED_KEEPALIVE_INTERVAL_S:
+        _logger.warning(
+            "%s=%r is above the %ss maximum; using %ss",
+            MANAGED_KEEPALIVE_INTERVAL_ENV_VAR,
+            raw,
+            _MAX_MANAGED_KEEPALIVE_INTERVAL_S,
+            _MAX_MANAGED_KEEPALIVE_INTERVAL_S,
+        )
+        return _MAX_MANAGED_KEEPALIVE_INTERVAL_S
+    return parsed
+
+
+# Ceiling for the in-sandbox host restart backoff, so a host that crashes on
+# every attempt settles into a slow retry instead of a hot loop.
+_RESTART_MAX_DELAY_S: int = 30
 
 
 def host_image_wheel_install_command(remote_tgz_path: str) -> str:
@@ -301,6 +391,15 @@ class SandboxCapabilityError(click.ClickException, _sandbox_types.SandboxError):
     """
 
 
+class SandboxGoneError(click.ClickException, _sandbox_types.SandboxError):
+    """Raised when a sandbox generation definitively no longer exists.
+
+    Resumable providers use this only for a definitive absence, never for a
+    timeout, connectivity failure, or unknown state. The managed-host wake path
+    catches it and provisions a fresh sandbox generation instead.
+    """
+
+
 @dataclass
 class RemoteCommandResult:
     """
@@ -476,15 +575,24 @@ class SandboxLifecycle(ABC):
         """
         raise self._capability_error("attach to an existing sandbox")
 
-    def keep_alive(self, sandbox_id: str) -> None:
+    def keep_alive(self, sandbox_id: str) -> bool | None:
         """
-        Configure the sandbox to survive idle periods (disable idle
-        autostop / maximize lifetime), so long agent runs don't lose
-        their host. Soft-fail: implementations should warn rather than
-        raise when the provider rejects the setting.
+        Keep the sandbox from being reclaimed while it is still in use,
+        so long agent runs don't lose their host. Soft-fail:
+        implementations should warn rather than raise when the provider
+        rejects the setting. Return ``False`` when an extension was attempted
+        but could not be confirmed (a soft failure the provider already logged),
+        so the managed keepalive loop can skip its success line; ``None`` or
+        ``True`` otherwise.
 
-        CLI-bootstrap capability — managed-only launchers need not
-        override the raising default.
+        Called BOTH once after a CLI bootstrap provision AND periodically
+        by the managed path for as long as the sandbox has a live runner
+        (:mod:`omnigent.server.managed_host_keepalive`), so an implementation
+        must be idempotent and cheap enough to repeat. Either shape
+        satisfies it: "configure once to maximize lifetime" (disable idle
+        autostop, restate a cap) or "push a deadline forward" (refresh an
+        absolute expiry). Managed-only launchers that cannot extend a
+        sandbox keep the raising default and are skipped.
 
         :param sandbox_id: The sandbox to configure.
         :raises SandboxCapabilityError: When the provider does not
@@ -538,7 +646,9 @@ class SandboxLifecycle(ABC):
         Optional capability: the default implementation raises
         :class:`SandboxCapabilityError` — providers whose SDK exposes
         programmatic termination override it. Used by the server's
-        managed-host cleanup when a managed session is deleted.
+        managed-host cleanup when a managed session is deleted. Implementations
+        must treat an already-absent sandbox as success so cleanup can retry
+        safely after a crash or database failure.
 
         :param sandbox_id: The sandbox to terminate, e.g.
             ``"sb-a1b2c3"``.
@@ -569,6 +679,8 @@ class SandboxLifecycle(ABC):
             ``"sb-a1b2c3"``.
         :raises SandboxCapabilityError: When the provider cannot resume a
             stopped sandbox (ephemeral sandboxes / no persistent volume).
+        :raises SandboxGoneError: When the sandbox generation definitively no
+            longer exists.
         :raises click.ClickException: If the resume fails.
         """
         raise self._capability_error("resume a stopped sandbox")
@@ -598,6 +710,58 @@ class SandboxLifecycle(ABC):
         return SandboxCapabilityError(
             f"The '{self.provider}' provider does not support the ability to {action}."
         )
+
+
+def supervise_host_command(command: str) -> str:
+    """
+    Wrap a host launch in a restart loop so a crash does not strand the sandbox.
+
+    The sandbox container outlives the host process: PID 1 is a placeholder
+    (``sleep infinity``) or the provider's own init, so a dead host leaves a
+    healthy, still-billing sandbox with nothing running in it. The only recovery
+    is the server re-provisioning a fresh sandbox on the next message, which
+    discards the workspace — restarting in place keeps the clone and the
+    installed dependencies.
+
+    The loop stands down on a clean exit, on
+    :data:`~omnigent.host.HOST_FATAL_EXIT_CODE` (a credential / version failure
+    that can never succeed), and on SIGTERM (a deliberate stop). Anything else
+    is a crash, retried with a doubling delay. A signal-kill of the host alone
+    (SIGKILL → 137) counts as a crash on purpose: that is what an OOM kill looks
+    like, and restarting is the wanted response.
+
+    A path that means to STOP the host must therefore signal the supervisor too,
+    not just the host — otherwise the loop faithfully restarts it. Both in-sandbox
+    stop paths already do: ``foreground_kill_command`` signals the process the
+    pidfile recorded (the supervisor, which is what ``exec``s under it), and
+    islo's preserved-daemon stop matches ``"omnigent host"`` against full argv,
+    which the supervisor's own ``sh -c <script>`` argv contains.
+
+    The attempt counter in the restart log makes a persistently-crashing host
+    observable — the loop never gives up, so a wedged box would otherwise be
+    silent apart from indistinguishable repeats.
+
+    :param command: The host launch, e.g. ``"OMNIGENT_HOST_TOKEN=… omnigent
+        host --server https://…"``. Env prefixes are re-applied per attempt.
+    :returns: A POSIX ``sh`` script ending in ``done``, so callers can append
+        redirections to it directly.
+    """
+    stop_codes = f"0|{HOST_FATAL_EXIT_CODE}|{HOST_SIGTERM_EXIT_CODE}"
+    return (
+        "delay=1\n"
+        "attempt=0\n"
+        "while :; do\n"
+        f"  {command}\n"
+        "  rc=$?\n"
+        f'  case "$rc" in {stop_codes}) exit "$rc";; esac\n'
+        "  attempt=$((attempt + 1))\n"
+        '  echo "omnigent host exited ($rc); attempt $attempt; '
+        'restarting in ${delay}s" >&2\n'
+        '  sleep "$delay"\n'
+        f'  delay=$((delay * 2)); [ "$delay" -gt {_RESTART_MAX_DELAY_S} ] '
+        f"&& delay={_RESTART_MAX_DELAY_S}\n"
+        "done"
+    )
 
 
 class SandboxExecTransport(SandboxLifecycle):
@@ -630,31 +794,32 @@ class SandboxExecTransport(SandboxLifecycle):
         self, sandbox_id: str, command: str, *, log_path: str = "/tmp/omnigent-host.log"
     ) -> RemoteCommandResult:
         """
-        Start *command* as a detached background process in the sandbox.
+        Start *command* under a supervisor as a detached background process.
 
-        The default wraps the command in ``setsid nohup sh -c '…' & echo
-        launched`` so it survives the exec session ending. The ``sh -c`` wrapper
-        is load-bearing: callers pass env-prefixed commands (e.g.
-        ``"ENV=val omnigent host …"``), and ``nohup`` does NOT honor shell
-        ``VAR=val`` assignment syntax — ``nohup ENV=val cmd`` makes nohup try to
-        exec a program literally named ``ENV=val`` ("No such file or directory").
-        Re-parsing the command under ``sh -c`` lets the inner shell apply the
-        assignments before running the program. Providers where backgrounded
-        processes are reaped on exec return (e.g. OpenShell) override this
-        to hold the exec stream open instead.
+        The command is wrapped in :func:`supervise_host_command` (restart on
+        crash) and then in ``setsid nohup sh -c '…' & echo launched`` so it
+        survives the exec session ending. The ``sh -c`` wrapper is load-bearing:
+        callers pass env-prefixed commands (e.g. ``"ENV=val omnigent host …"``),
+        and ``nohup`` does NOT honor shell ``VAR=val`` assignment syntax —
+        ``nohup ENV=val cmd`` makes nohup try to exec a program literally named
+        ``ENV=val`` ("No such file or directory"). Re-parsing the command under
+        ``sh -c`` lets the inner shell apply the assignments before running the
+        program. Providers where backgrounded processes are reaped on exec
+        return (e.g. OpenShell) override this to hold the exec stream open
+        instead — they supervise too, just without the detach.
 
         :param sandbox_id: Target sandbox.
         :param command: Shell command to background, e.g.
             ``"ENV=val omnigent host --server https://…"``.
-        :param log_path: Where stdout/stderr of the backgrounded process
-            are redirected inside the sandbox.
+        :param log_path: Where stdout/stderr of the supervisor and every host
+            attempt are redirected inside the sandbox.
         :returns: A synthetic result with ``stdout="launched\\n"`` on success.
         :raises click.ClickException: If the launch command fails.
         """
         return self.run(
             sandbox_id,
-            f"setsid nohup sh -c {shlex.quote(command)} "
-            f"> {log_path} 2>&1 < /dev/null & echo launched",
+            f"setsid nohup sh -c {shlex.quote(supervise_host_command(command))} "
+            f">> {log_path} 2>&1 < /dev/null & echo launched",
         )
 
     def put(self, sandbox_id: str, local_path: Path, remote_path: str) -> None:
@@ -740,9 +905,21 @@ class SandboxHostLauncher(SandboxLifecycle):
     Every managed-host provider — exec-model or entrypoint-as-host — implements
     this. :meth:`start_host` is abstract here; the exec-model default lives on
     :class:`ExecModelHostLauncher`. Entrypoint-as-host providers (e.g.
-    Kubernetes) inherit this class directly and override :meth:`start_host`
-    without needing any exec transport.
+    Kubernetes) and provider-native host launchers (e.g. Gensee) inherit this
+    class directly and override :meth:`start_host` without needing any exec
+    transport.
     """
+
+    def prepare_for_launch(self, *, agent_name: str | None = None) -> None:
+        """Set request context before provider preparation, allocation, or resume.
+
+        Providers with pre-created resources can use the resolved agent name
+        to select and validate compatible infrastructure before allocation.
+        """
+
+    def reaper_identity(self, workspace_id: int) -> AbstractContextManager[None]:
+        """Bind credentials needed for background cleanup in one workspace."""
+        return nullcontext()
 
     @abstractmethod
     def start_host(
@@ -753,9 +930,7 @@ class SandboxHostLauncher(SandboxLifecycle):
         host_id: str,
         host_name: str,
         server_url: str,
-        repo_url: str | None = None,
-        repo_branch: str | None = None,
-        repo_name: str | None = None,
+        repos: Sequence[RepoWorkspace] = (),
         host_config: dict[str, object] | None = None,
         on_stage: Callable[[str], None] | None = None,
     ) -> str:
@@ -768,16 +943,16 @@ class SandboxHostLauncher(SandboxLifecycle):
         :param host_name: Server-chosen host display name, e.g.
             ``"managed-a1b2c3d4"``.
         :param server_url: URL of this server the host dials back to.
-        :param repo_url: Repository clone URL, or ``None`` for an empty
-            workspace.
-        :param repo_branch: Branch to clone, or ``None`` for the default branch.
-        :param repo_name: Directory the clone lands in under the workspace, or
-            ``None`` when *repo_url* is ``None``.
+        :param repos: Repositories to clone into ``<workspace>/<repo_name>``
+            (empty for an empty workspace). The returned path is the single
+            clone directory when exactly one repo is cloned, else the
+            workspace root that parents them all.
         :param host_config: Deployment-supplied ``~/.omnigent/config.yaml``
             content installed into the sandbox's config BEFORE the host starts.
         :param on_stage: Progress observer invoked with ``"cloning"`` and
             ``"starting"``.
-        :returns: The absolute in-sandbox workspace path.
+        :returns: The absolute in-sandbox workspace path — the working
+            directory the host starts the agent in.
         """
 
 
@@ -791,7 +966,7 @@ class ExecModelHostLauncher(SandboxHostLauncher, SandboxExecTransport):
     managed-host bootstrap. A provider that only needs to change how the
     repository is obtained overrides :meth:`materialize_workspace` alone.
 
-    Entrypoint-as-host providers (e.g. Kubernetes) inherit
+    Entrypoint-as-host and provider-native host launchers inherit
     :class:`SandboxHostLauncher` directly and do NOT need ``run()`` or any
     exec transport.
     """
@@ -804,9 +979,7 @@ class ExecModelHostLauncher(SandboxHostLauncher, SandboxExecTransport):
         host_id: str,
         host_name: str,
         server_url: str,
-        repo_url: str | None = None,
-        repo_branch: str | None = None,
-        repo_name: str | None = None,
+        repos: Sequence[RepoWorkspace] = (),
         host_config: dict[str, object] | None = None,
         on_stage: Callable[[str], None] | None = None,
     ) -> str:
@@ -814,11 +987,16 @@ class ExecModelHostLauncher(SandboxHostLauncher, SandboxExecTransport):
         Start ``omnigent host`` in the sandbox and return the workspace path.
 
         The default is the EXEC model: probe ``$HOME``, create
-        ``<HOME>/workspace``, optionally materialize the repository into it (via
-        :meth:`materialize_workspace`, which clones by default), merge any
-        *host_config* into ``~/.omnigent/config.yaml``, and start the host
-        detached (``setsid``-backgrounded, identity + token in the process
+        ``<HOME>/workspace``, clone each requested repo into it (via
+        :meth:`materialize_workspace`), merge any *host_config* into
+        ``~/.omnigent/config.yaml``, and start the host detached
+        (``setsid``-backgrounded, identity + token in the process
         environment) — all driven through :meth:`run` / :meth:`run_background`.
+
+        The working directory is the single clone directory when exactly one
+        repo is cloned, else the workspace root parenting them all (or an empty
+        workspace when none are requested). Clones run sequentially here; the
+        entrypoint-as-host launchers (Kubernetes) clone in parallel.
 
         :returns: The absolute in-sandbox workspace path.
         """
@@ -830,15 +1008,24 @@ class ExecModelHostLauncher(SandboxHostLauncher, SandboxExecTransport):
             )
         workspace = f"{home}/workspace"
         self.run(sandbox_id, f"mkdir -p {shlex.quote(workspace)}")
-        if repo_url is not None:
-            workspace = self.materialize_workspace(
-                sandbox_id,
-                workspace=workspace,
-                repo_url=repo_url,
-                repo_branch=repo_branch,
-                repo_name=repo_name,
-                on_stage=on_stage,
-            )
+        if repos:
+            if on_stage is not None:
+                on_stage("cloning")
+            # Distinct URLs can derive the same repo_name (e.g. two orgs' "api");
+            # disambiguate so they don't clone into one colliding directory.
+            clone_dirs = [
+                self.materialize_workspace(
+                    sandbox_id,
+                    workspace=workspace,
+                    repo_url=repo.url,
+                    repo_branch=repo.branch,
+                    repo_name=dirname,
+                )
+                for repo, dirname in zip(repos, _sandbox_types.clone_dir_names(repos), strict=True)
+            ]
+            # One repo → drop the agent straight into it; several → the
+            # workspace root that parents them all.
+            workspace = clone_dirs[0] if len(clone_dirs) == 1 else workspace
         if on_stage is not None:
             on_stage("starting")
         if host_config is not None or self.capabilities.resume_stopped:

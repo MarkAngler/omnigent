@@ -1,3 +1,7 @@
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+
+vi.mock("@/hooks/useScopeCache", () => import("@/test/mockScopeCache"));
+import { SidebarDataProvider } from "@/hooks/useSidebarData";
 // Tests for the sidebar kebab's "Stop session" item (moved here from the
 // chat header). Contract: the item renders only for stoppable sessions
 // (isSessionStoppable: host-spawned or claude-native) whose runner isn't
@@ -10,7 +14,6 @@ import type * as RunnerHealthProviderModule from "@/hooks/RunnerHealthProvider";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { MemoryRouter } from "react-router-dom";
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { TooltipProvider } from "@/components/ui/tooltip";
 
 // Controllable stop mutation + runner-liveness lookup, declared via
@@ -39,9 +42,11 @@ vi.mock("@/hooks/useConversations", () => ({
   setConversationPinned: vi.fn(() => Promise.resolve({})),
   PINNED_CONVERSATIONS_KEY: ["pinned-conversations"],
   useRenameConversation: () => ({ mutate: vi.fn() }),
+  useLeaveSession: () => ({ mutate: vi.fn(), isPending: false }),
   useArchiveConversation: () => ({ mutate: vi.fn() }),
   useBulkArchiveConversations: () => ({ mutate: vi.fn(), isPending: false, isError: false }),
   useBulkDeleteConversations: () => ({ mutate: vi.fn(), isPending: false, isError: false }),
+  useBulkMoveToProject: () => ({ mutate: vi.fn(), isPending: false, isError: false }),
   useBulkStopSessions: () => ({ mutate: vi.fn(), isPending: false, isError: false }),
   useStopSession: () => mocks.stop,
   useProjects: () => ({ data: [] }),
@@ -112,11 +117,13 @@ function renderSidebar() {
   const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
   return render(
     <QueryClientProvider client={qc}>
-      <TooltipProvider>
-        <MemoryRouter initialEntries={["/"]}>
-          <Sidebar open={true} onClose={vi.fn()} />
-        </MemoryRouter>
-      </TooltipProvider>
+      <SidebarDataProvider>
+        <TooltipProvider>
+          <MemoryRouter initialEntries={["/"]}>
+            <Sidebar open={true} onClose={vi.fn()} />
+          </MemoryRouter>
+        </TooltipProvider>
+      </SidebarDataProvider>
     </QueryClientProvider>,
   );
 }
@@ -129,6 +136,7 @@ function openKebab() {
 beforeEach(() => {
   mocks.stop.mutate.mockReset();
   mocks.stop.reset.mockReset();
+  mocks.stop.isPending = false;
   mocks.runnerOnline.mockReset();
   mocks.runnerOnline.mockReturnValue(undefined);
 });
@@ -151,6 +159,21 @@ describe("sidebar Stop session item", () => {
     expect(mocks.stop.mutate).toHaveBeenCalledTimes(1);
     // Failure: the dialog stopped a different row's session.
     expect(mocks.stop.mutate.mock.calls[0][0]).toBe("conv_1");
+  });
+
+  it("spins the confirm button while the stop is in flight", () => {
+    // The stop can take seconds. Without the spinner the button only fades
+    // (disabled), which reads as a hang rather than work in progress.
+    mocks.stop.isPending = true;
+    mockConversations([HOST_SPAWNED]);
+    renderSidebar();
+    openKebab();
+    fireEvent.click(screen.getByTestId("stop-conversation"));
+
+    const confirm = screen.getByTestId("stop-session-confirm");
+    expect(confirm).toHaveAttribute("aria-busy", "true");
+    expect(confirm).toBeDisabled();
+    expect(screen.getByRole("status", { name: "Loading" })).toBeInTheDocument();
   });
 
   it("clears a prior stop failure when the dialog is opened", () => {
@@ -205,7 +228,12 @@ describe("sidebar Stop session item", () => {
     mockConversations([{ ...HOST_SPAWNED, owner: "other@example.com" }]);
     renderSidebar();
     // Radix Tabs triggers activate on mousedown (primary button), not click.
-    fireEvent.mouseDown(screen.getByTestId("sidebar-tab-shared"), { button: 0 });
+    fireEvent.pointerDown(screen.getByTestId("session-filter"), {
+      button: 0,
+      ctrlKey: false,
+      pointerType: "mouse",
+    });
+    fireEvent.click(screen.getByTestId("session-filter-shared"));
     openKebab();
     const item = screen.getByTestId("stop-conversation");
     expect(item).toHaveAttribute("data-disabled");
